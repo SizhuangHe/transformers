@@ -48,8 +48,6 @@ from ...utils import (
 )
 from .configuration_gpt_neox import GPTNeoXConfig
 
-from ipdb import set_trace
-
 
 if is_flash_attn_2_available():
     from ...modeling_flash_attention_utils import _flash_attention_forward
@@ -154,9 +152,6 @@ def flash_attention_forward(
     target_dtype=None,
     **_kwargs,
 ):
-    '''
-        The attention_mask argument is the 2D tensor ([batch_size, seq_len]), that is the padding mask for the input sequence.
-    '''
     query_length = query.shape[-2]
 
     # GPT-neo-X casts query and key in fp32 to apply rotary embedding in full precision
@@ -184,16 +179,12 @@ def flash_attention_forward(
         is_causal=True,
         use_top_left_mask=flash_attn_uses_top_left_mask,
         target_dtype=target_dtype,
-    ) # * shape [batch_size, seq_len, n_heads, hidden_dim/n_head]
-    set_trace()
+    )
+
     return attn_output, None
 
 
 def sdpa_attention_forward(query, key, value, attention_mask, attention_dropout, training, **_kwargs):
-    '''
-        The attention_mask argument here can be the actual 4D causal masks rather than the 2D padding mask.
-        Therefore, we only need to pass in our own customized causal mask via the attention_mask argument. No need to change this function.
-    '''
     q_len = query.shape[-2]
 
     causal_mask = attention_mask
@@ -357,7 +348,7 @@ class GPTNeoXAttention(nn.Module):
                 f"Setting `attention_type` to `eager` because `dropout` is not supported in `{attention_type}`."
             )
             attention_type = "eager"
-        # set_trace()
+
         # Compute attention
         attn_output, attn_weights = GPTNEOX_ATTENTION_FUNCTION[attention_type](
             query,
@@ -372,11 +363,11 @@ class GPTNeoXAttention(nn.Module):
             # Flash Attention 2 specific PEFT check
             target_dtype=self._fa_peft_dtype_check(value),
         )
-        # set_trace()
+
         # Reshape outputs and final projection
         attn_output = attn_output.contiguous()
-        attn_output = attn_output.view(bsz, seq_len, -1) # * shape [batch_size, seq_len, hidden_dim]
-        attn_output = self.dense(attn_output) 
+        attn_output = attn_output.view(bsz, seq_len, -1)
+        attn_output = self.dense(attn_output)
 
         outputs = (attn_output, present)
         if output_attentions:
@@ -635,7 +626,7 @@ class GPTNeoXLayer(nn.Module):
     def forward(
         self,
         hidden_states: Optional[torch.FloatTensor],
-        attention_mask: Optional[torch.FloatTensor] = None, # ! Pass in the 4D causal mask here
+        attention_mask: Optional[torch.FloatTensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         head_mask: Optional[torch.FloatTensor] = None,
         use_cache: Optional[bool] = False,
@@ -792,7 +783,7 @@ class GPTNeoXModel(GPTNeoXPreTrainedModel):
         output_type=BaseModelOutputWithPast,
         config_class=_CONFIG_FOR_DOC,
     )
-    def forward( # TODO: pass in the causal mask to the forward function instead of making it inside. No need to pass in the attention mask then.
+    def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
         attention_mask: Optional[torch.FloatTensor] = None,
@@ -805,14 +796,12 @@ class GPTNeoXModel(GPTNeoXPreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
-        seq_lens: Optional[torch.LongTensor] = None,
+        causal_mask: Optional[torch.Tensor] = None,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         r"""
         use_cache (`bool`, *optional*):
             If set to `True`, `past_key_values` key value states are returned and can be used to speed up decoding (see
             `past_key_values`).
-        seq_lens (`torch.LongTensor` of shape `(batch_size)`, *optional*):
-            The length of each sequence (1 time point, including the SEP token, not referring to the entire trajectory) in the batch.
         """
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -856,12 +845,11 @@ class GPTNeoXModel(GPTNeoXPreTrainedModel):
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
 
-        causal_mask = self._update_causal_mask(
-            attention_mask, inputs_embeds, cache_position, past_key_values, output_attentions, seq_lens=seq_lens
-        )
-        # print("Final causal mask:")
-        # print('\n'.join([' '.join(['X' if val != 0 else '0' for val in row]) for row in causal_mask[0].squeeze(0)]))
-        # set_trace()
+        if causal_mask is None:
+            causal_mask = self._update_causal_mask(
+                attention_mask, inputs_embeds, cache_position, past_key_values, output_attentions
+            )
+
         # Prepare head mask if needed
         # 1.0 in head_mask indicate we keep the head
         # attention_probs has shape bsz x n_heads x N x N
@@ -904,7 +892,7 @@ class GPTNeoXModel(GPTNeoXPreTrainedModel):
             else:
                 outputs = layer(
                     hidden_states,
-                    attention_mask=causal_mask, # ! The causal mask is input here. We can change it and then turn off the default ones.
+                    attention_mask=causal_mask,
                     position_ids=position_ids,
                     head_mask=head_mask[i],
                     layer_past=past_key_values,
@@ -938,7 +926,6 @@ class GPTNeoXModel(GPTNeoXPreTrainedModel):
             attentions=all_attentions,
         )
 
-    # TODO: do something with flash attn
     # Copied from transformers.models.llama.modeling_llama.LlamaModel._update_causal_mask
     def _update_causal_mask(
         self,
@@ -947,7 +934,6 @@ class GPTNeoXModel(GPTNeoXPreTrainedModel):
         cache_position: torch.Tensor,
         past_key_values: Cache,
         output_attentions: bool,
-        seq_lens: Optional[torch.LongTensor] = None,
     ):
         if self.config._attn_implementation == "flash_attention_2":
             if attention_mask is not None and (attention_mask == 0.0).any():
@@ -990,12 +976,8 @@ class GPTNeoXModel(GPTNeoXPreTrainedModel):
             device=device,
             cache_position=cache_position,
             batch_size=input_tensor.shape[0],
-            causal_mask_type=self.config.causal_mask_type,
-            causal_mask_block_num=self.config.causal_mask_block_num,
-            causal_mask_block_history=self.config.causal_mask_block_history,
-            seq_lens=seq_lens,
         )
-        # set_trace()
+
         if (
             self.config._attn_implementation == "sdpa"
             and attention_mask is not None
@@ -1006,18 +988,12 @@ class GPTNeoXModel(GPTNeoXPreTrainedModel):
             # using left padding. This is required by F.scaled_dot_product_attention memory-efficient attention path.
             # Details: https://github.com/pytorch/pytorch/issues/110213
             min_dtype = torch.finfo(dtype).min
-            # print('\n'.join([' '.join(['X' if val < 0 else str(int(val)) for val in causal_mask[0,0,j,:]]) for j in range(causal_mask.size(2))]))
-            # set_trace()
             causal_mask = AttentionMaskConverter._unmask_unattended(causal_mask, min_dtype)
-
-            # print('\n'.join([' '.join(['X' if val < 0 else str(int(val)) for val in causal_mask[0,0,j,:]]) for j in range(causal_mask.size(2))]))
-            # set_trace()
 
         return causal_mask
 
     @staticmethod
     # Copied from transformers.models.llama.modeling_llama.LlamaModel._prepare_4d_causal_attention_mask_with_cache_position
-    # TODO: can separate this whole thing outside of the model
     def _prepare_4d_causal_attention_mask_with_cache_position(
         attention_mask: torch.Tensor,
         sequence_length: int,
@@ -1026,10 +1002,6 @@ class GPTNeoXModel(GPTNeoXPreTrainedModel):
         device: torch.device,
         cache_position: torch.Tensor,
         batch_size: int,
-        causal_mask_type: str = "causal",
-        causal_mask_block_num: int = 1,
-        causal_mask_block_history: int = 1,
-        seq_lens: Optional[torch.LongTensor] = None,
         **kwargs,
     ):
         """
@@ -1058,220 +1030,23 @@ class GPTNeoXModel(GPTNeoXPreTrainedModel):
             # In this case we assume that the mask comes already in inverted form and requires no inversion or slicing.
             causal_mask = attention_mask
         else:
-            min_dtype = torch.finfo(dtype).min # Find the min value for the dtype
-            
-            # TODO: this is the part that actually creates the causal mask
-            # causal_mask = torch.full(
-            #         (sequence_length, target_length), fill_value=min_dtype, dtype=dtype, device=device
-            #     ) # Create a full tensor of the size (sequence_length, target_length) with the min value for the dtype
-            if causal_mask_type == "causal":
-                causal_mask = torch.full(
-                    (sequence_length, target_length), fill_value=min_dtype, dtype=dtype, device=device
-                ) # Create a full tensor of the size (sequence_length, target_length) with the min value for the dtype
-                if sequence_length != 1:
-                    causal_mask = torch.triu(causal_mask, diagonal=1) # Only keep the upper triangular part of the causal_mask, shape [seq_len, seq_len]
-                    causal_mask = causal_mask[None, :,:].repeat(batch_size, 1, 1) # Expand the causal_mask to the size (batch_size, 1, seq_len, seq_len)
-                    causal_mask = causal_mask[:, None, :, :]
-                    if attention_mask is not None:
-                        causal_mask = causal_mask.clone()  # copy to contiguous memory for in-place edit
-                        mask_length = attention_mask.shape[-1]
-                        padding_mask = causal_mask[:, :, :, :mask_length] + attention_mask[:, None, None, :] # for block history and block, all Falses. 
-                        # set_trace()
-                        padding_mask = padding_mask == 0
-                        causal_mask[:, :, :, :mask_length] = causal_mask[:, :, :, :mask_length].masked_fill(
-                            padding_mask, min_dtype
-                        )
-                # set_trace()
-            elif causal_mask_type == "block":
-                # set_trace()
-                if sequence_length != 1:
-                    # n_blocks, block_size = 4, 2  # 4x4 blocks, each of size 2x2
-                    causal_masks = []
-                    for causal_mask_block_size in seq_lens:
-                        causal_mask = torch.full(
-                            (sequence_length, target_length), fill_value=min_dtype, dtype=dtype, device=device
-                        )
-                        # Step 1: Create a lower triangular matrix of ones at the block level
-                        block_tril = torch.tril(torch.ones((causal_mask_block_num, causal_mask_block_num), dtype=torch.float32, device=device))
-                        # set_trace()
-                        # Step 2: Expand each entry in block_tril to a block of shape (block_size, block_size)
-                        expanded_blocks = block_tril.repeat_interleave(causal_mask_block_size, dim=0).repeat_interleave(causal_mask_block_size, dim=1)
+            min_dtype = torch.finfo(dtype).min
+            causal_mask = torch.full(
+                (sequence_length, target_length), fill_value=min_dtype, dtype=dtype, device=device
+            )
+            if sequence_length != 1:
+                causal_mask = torch.triu(causal_mask, diagonal=1)
+            causal_mask *= torch.arange(target_length, device=device) > cache_position.reshape(-1, 1)
+            causal_mask = causal_mask[None, None, :, :].expand(batch_size, 1, -1, -1)
+            if attention_mask is not None:
+                causal_mask = causal_mask.clone()  # copy to contiguous memory for in-place edit
+                mask_length = attention_mask.shape[-1]
+                padding_mask = causal_mask[:, :, :, :mask_length] + attention_mask[:, None, None, :]
+                padding_mask = padding_mask == 0
+                causal_mask[:, :, :, :mask_length] = causal_mask[:, :, :, :mask_length].masked_fill(
+                    padding_mask, min_dtype
+                )
 
-                        # Step 3: Create the final matrix and append additional rows and columns
-                        final_matrix = torch.zeros((expanded_blocks.shape[0] + 2, expanded_blocks.shape[1] + 2), dtype=torch.float32)
-
-                        # Fill the middle with the previous expanded blocks
-                        final_matrix[1:-1, 1:-1] = expanded_blocks  
-
-                        # Add the first top row and bottom row
-                        final_matrix[0, :causal_mask_block_size + 1] = 1  # Top row
-                        final_matrix[-1, :] = 1  # Bottom row
-
-                        # Add the leftmost and rightmost columns
-                        final_matrix[:, 0] = 1  # Leftmost column
-                        final_matrix[-(causal_mask_block_size + 1):, -1] = 1  # Rightmost column
-
-                        # 2 here should actually be -infinity. Use 2 because it looks better when printed.
-
-                        # Step 4: Expand final_matrix to match the size of the original matrix
-                        mask = final_matrix.bool()  # Convert to boolean mask
-
-                        # Step 6: Apply the mask to the original matrix
-                        masked_matrix = causal_mask.clone()  # Create a copy of the original matrix
-                        masked_matrix[:mask.shape[0], :mask.shape[1]][mask] = 0
-                        causal_mask = masked_matrix
-
-                        # Display the original matrix and the masked matrix
-                        # print("-------------")
-                        # print("Original Matrix:")
-                        # print('\n'.join([' '.join(['X' if val != 0 else '0' for val in row]) for row in causal_mask]))
-                        # print("\nMask matrix:")
-                        # print('\n'.join([' '.join(['X' if val != 0 else '0' for val in row]) for row in final_matrix]))
-                        # print("\nMasked Matrix:")
-                        # print('\n'.join([' '.join(['X' if val != 0 else '0' for val in row]) for row in causal_mask]))
-                        causal_masks.append(causal_mask)
-                    causal_mask = torch.stack(causal_masks, dim=0)
-                    causal_mask = causal_mask[:, None, :, :]
-                    # The following code is to minic the padding mask in the causal mask. Ideally, we mask everything related to pads. However, later on, to boost performance (this is a SDPA issue), entirely masked rows will be unmasked.
-                    # Therefore, here we unmask the bottom left corner (corresponding to pad-rows and non-pad-cols).
-                    
-                    
-                    
-                    num_non_pads = attention_mask.sum(dim=1)
-                    num_pads = (attention_mask == 0).sum(dim=1)
-                    
-                    # Create indices for the padding regions
-                    pad_start = (attention_mask.size(1) - num_pads).unsqueeze(1).unsqueeze(2).unsqueeze(1)  # [B, 1, 1, 1]
-                    non_pad_end = num_non_pads.unsqueeze(1).unsqueeze(2).unsqueeze(1)  # [B, 1, 1, 1]
-                    
-                    # Create mask for padding regions
-                    row_indices = torch.arange(causal_mask.size(2), device=causal_mask.device)
-                    col_indices = torch.arange(causal_mask.size(3), device=causal_mask.device)
-                    
-                    # Broadcast to create masks
-                    row_mask = (row_indices[None, None, :, None] >= pad_start) 
-                    col_mask = (col_indices[None, None, None, :] < non_pad_end)
-                    
-                    # Apply masks
-                    padding_mask = (row_mask & col_mask)
-                    causal_mask = causal_mask.masked_fill(padding_mask, 0)
-                    # set_trace()
-                    # set_trace()
-            elif causal_mask_type == "block_history":
-                if sequence_length != 1:
-                    causal_masks = []
-                    for causal_mask_block_size in seq_lens:
-                        causal_mask = torch.full(
-                                (sequence_length, target_length), fill_value=min_dtype, dtype=dtype, device=device
-                            )
-                        # Step 1: Create a block-level mask initialized to zero
-                        block_level_mask = torch.zeros(causal_mask_block_num, causal_mask_block_num, device=device)
-
-                        # Step 2: Fill in the mask based on the look back parameter
-                        # Create an index tensor for the mask
-                        indices = torch.arange(causal_mask_block_num).unsqueeze(0) - torch.arange(causal_mask_block_num).unsqueeze(1)
-
-                        # Set the conditions for the mask
-                        block_level_mask[indices >= -causal_mask_block_history] = 1
-
-                        # Display the resulting block-level mask
-                        # print("Block-Level Mask: shape", block_level_mask.shape)
-                        # print(block_level_mask)
-
-                        upper_triangular_mask = torch.tril(torch.ones(causal_mask_block_num, causal_mask_block_num, device=device), diagonal=0)
-                        combined_mask = block_level_mask * upper_triangular_mask
-                        # print("Combined Mask: shape", combined_mask.shape)
-                        # print(combined_mask)
-
-                        expanded_mask = combined_mask.repeat_interleave(causal_mask_block_size, dim=0).repeat_interleave(causal_mask_block_size, dim=1)
-                        
-                        # print("\nExpanded Mask in Matrix Format: shape", expanded_mask.shape)
-                        # for i in range(expanded_mask.size(0)):
-                        #     row = ' '.join([f'{val:.0f}' for val in expanded_mask[i]])
-                        #     print(row)
-
-                        # Copy top row and append before top row
-                        top_row = expanded_mask[0].clone()
-                        expanded_mask = torch.cat([top_row.unsqueeze(0), expanded_mask], dim=0)
-                        # Copy bottom row and append after bottom row
-                        bottom_row = expanded_mask[-1].clone()
-                        expanded_mask = torch.cat([expanded_mask, bottom_row.unsqueeze(0)], dim=0)
-
-                        # Copy left most column and append before left most column
-                        left_column = expanded_mask[:, 0].clone()
-                        expanded_mask = torch.cat([left_column.unsqueeze(1), expanded_mask], dim=1)
-
-                        # Copy right most column and append after right most column
-                        right_column = expanded_mask[:, -1].clone()
-                        expanded_mask = torch.cat([expanded_mask, right_column.unsqueeze(1)], dim=1)
-
-
-
-
-
-                        # print("\nExpanded Mask with first and last blocks extended: shape", expanded_mask.shape)
-                        # for i in range(expanded_mask.size(0)):
-                        #     row = ' '.join([f'{val:.0f}' for val in expanded_mask[i]])
-                        #     print(row)
-
-
-                        final_mask = torch.tril(torch.ones_like(expanded_mask), diagonal=0) * expanded_mask
-                        # print("\nFinal Mask in Matrix Format: shape", final_mask.shape)
-                        # for i in range(final_mask.size(0)):
-                        #     row = ' '.join([f'{val:.0f}' for val in final_mask[i]])
-                        #     print(row)
-                        mask = final_mask.bool()
-                        masked_matrix = causal_mask.clone()  # Create a copy of the original matrix
-                        masked_matrix[:mask.shape[0], :mask.shape[1]][mask] = 0
-                        causal_mask = masked_matrix
-                        # print("\nFinal causal mask (right before addressing attention masks) in Matrix Format: shape", masked_matrix.shape)
-                        # print('\n'.join([' '.join(['X' if val != 0 else '0' for val in masked_matrix[i]]) for i in range(masked_matrix.size(0))]))
-                        causal_masks.append(causal_mask)
-                    causal_mask = torch.stack(causal_masks, dim=0)
-                    causal_mask = causal_mask[:, None, :, :]
-                    # set_trace()
-
-
-                    # The following code is to minic the padding mask in the causal mask. Ideally, we mask everything related to pads. However, later on, to boost performance (this is a SDPA issue), entirely masked rows will be unmasked.
-                    # Therefore, here we unmask the bottom left corner (corresponding to pad-rows and non-pad-cols).
-                    num_non_pads = attention_mask.sum(dim=1)
-                    num_pads = (attention_mask == 0).sum(dim=1)
-                    
-                    # Create indices for the padding regions
-                    pad_start = (attention_mask.size(1) - num_pads).unsqueeze(1).unsqueeze(2).unsqueeze(1)  # [B, 1, 1, 1]
-                    non_pad_end = num_non_pads.unsqueeze(1).unsqueeze(2).unsqueeze(1)  # [B, 1, 1, 1]
-                    
-                    # Create mask for padding regions
-                    row_indices = torch.arange(causal_mask.size(2), device=causal_mask.device)
-                    col_indices = torch.arange(causal_mask.size(3), device=causal_mask.device)
-                    
-                    # Broadcast to create masks
-                    row_mask = (row_indices[None, None, :, None] >= pad_start) 
-                    col_mask = (col_indices[None, None, None, :] < non_pad_end)
-                    
-                    # Apply masks
-                    padding_mask = (row_mask & col_mask)
-                    causal_mask = causal_mask.masked_fill(padding_mask, 0)
-                    # set_trace()
-
-            else:
-                raise ValueError(f"Invalid causal mask type: {causal_mask_type}. Valid types are: causal, block, block_history")
-
-
-                    
-
-                    
-            
-            # The rest of the code is just to make sure the causal_mask is the correct size and to add the padding mask
-            # set_trace()
-            # causal_mask *= (torch.arange(target_length, device=device) > cache_position.reshape(-1, 1)) # Only keep the causal_mask for the tokens that are not past tokens
-            # causal_mask = causal_mask[None, None, :, :].expand(batch_size, 1, -1, -1) # Expand the causal_mask to the size (batch_size, 1, sequence_length, target_length)
-            # set_trace()
-            
-            # print("Causal mask to return")
-            # print('\n'.join([' '.join(['X' if val < 0 else str(int(val)) for val in causal_mask[0,0,j,:]]) for j in range(causal_mask.size(2))]))
-            
-            # set_trace()
         return causal_mask
 
 
@@ -1312,7 +1087,7 @@ class GPTNeoXForCausalLM(GPTNeoXPreTrainedModel, GenerationMixin):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
-        seq_lens: Optional[torch.LongTensor] = None,
+        causal_mask: Optional[torch.Tensor] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         r"""
         labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
@@ -1355,7 +1130,7 @@ class GPTNeoXForCausalLM(GPTNeoXPreTrainedModel, GenerationMixin):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
             cache_position=cache_position,
-            seq_lens=seq_lens,
+            causal_mask=causal_mask,
         )
 
         hidden_states = outputs[0]
