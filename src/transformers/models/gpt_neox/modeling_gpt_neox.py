@@ -274,6 +274,12 @@ class GPTNeoXAttention(nn.Module):
         self.rotary_ndims = int(self.head_size * config.rotary_pct)
         self.rope_theta = config.rotary_emb_base
         self._init_bias(config.max_position_embeddings)
+        
+        self.use_rope_2d = config.use_rope_2d
+        self.rope_2d_pct = config.rope_2d_pct
+        self.rope_2d_max_embedding = config.rope_2d_max_embedding
+        self.rope_2d_ndims = int(self.head_size * config.rope_2d_pct)
+        
 
         self.register_buffer("masked_bias", torch.tensor(-1e9), persistent=False)
         self.rotary_emb = GPTNeoXRotaryEmbedding(config=self.config)
@@ -314,6 +320,7 @@ class GPTNeoXAttention(nn.Module):
         padding_mask: Optional[torch.Tensor] = None,
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
+        rope2d_timestep_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ):
         bsz, seq_len, _ = hidden_states.shape
 
@@ -325,6 +332,7 @@ class GPTNeoXAttention(nn.Module):
             use_cache=use_cache,
             cache_position=cache_position,
             position_embeddings=position_embeddings,
+            rope2d_timestep_embeddings=rope2d_timestep_embeddings,
         )
 
         # Checking for fallbacks in case an unsupported feature is requested
@@ -408,6 +416,7 @@ class GPTNeoXAttention(nn.Module):
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
+        rope2d_timestep_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ):
         # Compute QKV
         # Attention heads [batch, seq_len, hidden_size]
@@ -425,25 +434,33 @@ class GPTNeoXAttention(nn.Module):
         value = qkv[..., 2 * self.head_size :].permute(0, 2, 1, 3)
 
         # Compute rotary embeddings on rotary_ndims
-        query_rot = query[..., : self.rotary_ndims]
-        query_pass = query[..., self.rotary_ndims :]
-        key_rot = key[..., : self.rotary_ndims]
-        key_pass = key[..., self.rotary_ndims :]
+        if not self.use_rope_2d:
+            query_rot = query[..., : self.rotary_ndims]
+            query_pass = query[..., self.rotary_ndims :]
+            key_rot = key[..., : self.rotary_ndims]
+            key_pass = key[..., self.rotary_ndims :]
 
-        cos, sin = position_embeddings
-        query, key = apply_rotary_pos_emb(query_rot, key_rot, cos, sin)
-        query = torch.cat((query, query_pass), dim=-1)
-        key = torch.cat((key, key_pass), dim=-1)
-
-        # Cache QKV values
-        if layer_past is not None:
-            cache_kwargs = {
-                "sin": sin,
-                "cos": cos,
-                "partial_rotation_size": self.rotary_ndims,
-                "cache_position": cache_position,
-            }
-            key, value = layer_past.update(key, value, self.layer_idx, cache_kwargs)
+            cos, sin = position_embeddings
+            query, key = apply_rotary_pos_emb(query_rot, key_rot, cos, sin)
+            query = torch.cat((query, query_pass), dim=-1)
+            key = torch.cat((key, key_pass), dim=-1)
+        else:
+            query_rot_1 = query[..., : self.rotary_ndims]
+            query_rot_2 = query[..., self.rotary_ndims: self.rotary_ndims+self.rope_2d_ndims]
+            query_pass = query[..., self.rotary_ndims+self.rope_2d_ndims:]
+            key_rot_1 = key[..., : self.rotary_ndims]
+            key_rot_2 = key[..., self.rotary_ndims: self.rotary_ndims+self.rope_2d_ndims]
+            key_pass = key[..., self.rotary_ndims+self.rope_2d_ndims:]
+            
+            cos1, sin1 = position_embeddings
+            cos2, sin2 = rope2d_timestep_embeddings
+            
+            query_rot_1, key_rot_1 = apply_rotary_pos_emb(query_rot_1, key_rot_1, cos1, sin1)
+            query_rot_2, key_rot_2 = apply_rotary_pos_emb(query_rot_2, key_rot_2, cos2, sin2)
+            
+            query = torch.cat((query_rot_1, query_rot_2, query_pass), dim=-1)
+            key = torch.cat((key_rot_1, key_rot_2, key_pass), dim=-1)
+            
 
         return query, key, value, layer_past
 
@@ -488,6 +505,76 @@ class GPTNeoXSdpaAttention(GPTNeoXAttention):
             "attribute of the `GPTNeoXAttention` class! It will be removed in v4.48"
         )
 
+# Copied from transformers.models.llama.modeling_llama.LlamaRotaryEmbedding with Llama->GPTNeoX
+class GPTNeoXRotary2DEmbedding(nn.Module):
+    def __init__(self, config: GPTNeoXConfig, device=None):
+        super().__init__()
+        # BC: "rope_type" was originally "type"
+        
+        self.rope_type = "default"
+        self.max_seq_len_cached = config.rope_2d_max_embedding
+        self.original_max_seq_len = config.rope_2d_max_embedding
+
+        self.config = config
+        self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
+
+        inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)
+        self.register_buffer("inv_freq", inv_freq, persistent=False)    # [1, seq_len, 1]
+        self.original_inv_freq = self.inv_freq
+
+
+    @torch.no_grad()
+    def forward(self, x, timestep_ids):
+        # Core RoPE block
+        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(timestep_ids.shape[0], -1, 1)
+        timestep_ids_expanded = timestep_ids[:, None, :].float()
+        # Force float32 (see https://github.com/huggingface/transformers/pull/29285)
+        device_type = x.device.type
+        device_type = device_type if isinstance(device_type, str) and device_type != "mps" else "cpu"
+        with torch.autocast(device_type=device_type, enabled=False):
+            freqs = (inv_freq_expanded.float() @ timestep_ids_expanded.float()).transpose(1, 2)
+            emb = torch.cat((freqs, freqs), dim=-1)
+            cos = emb.cos()
+            sin = emb.sin()
+
+        # Advanced RoPE types (e.g. yarn) apply a post-processing scaling factor, equivalent to scaling attention
+        cos = cos * self.attention_scaling
+        sin = sin * self.attention_scaling
+
+        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+    
+    def _compute_default_rope_parameters(
+        self,
+        config = None,
+        device = None,
+        seq_len = None,
+        **rope_kwargs,
+    ) -> Tuple["torch.Tensor", float]:
+        """
+        Computes the inverse frequencies according to the original RoPE implementation
+        Args:
+            config ([`~transformers.PretrainedConfig`]):
+                The model configuration.
+            device (`torch.device`):
+                The device to use for initialization of the inverse frequencies.
+            seq_len (`int`, *optional*):
+                The current sequence length. Unused for this type of RoPE.
+            rope_kwargs (`Dict`, *optional*):
+                BC compatibility with the previous RoPE class instantiation, will be removed in v4.45.
+        Returns:
+            Tuple of (`torch.Tensor`, `float`), containing the inverse frequencies for the RoPE embeddings and the
+            post-processing scaling factor applied to the computed cos/sin (unused in this type of RoPE).
+        """
+        base = config.rope_2d_embed_base
+        rope_2d_partial_rotary_factor = config.rope_2d_partial_rotary_factor if hasattr(config, "rope_2d_partial_rotary_factor") else 1.0
+        head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+        dim = int(head_dim * rope_2d_partial_rotary_factor)
+
+        attention_factor = 1.0  # Unused in this type of RoPE
+
+        # Compute the inverse frequencies
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.int64).float().to(device) / dim))
+        return inv_freq, attention_factor
 
 # Copied from transformers.models.llama.modeling_llama.LlamaRotaryEmbedding with Llama->GPTNeoX
 class GPTNeoXRotaryEmbedding(nn.Module):
@@ -505,7 +592,7 @@ class GPTNeoXRotaryEmbedding(nn.Module):
         self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
 
         inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self.register_buffer("inv_freq", inv_freq, persistent=False)    # [1, seq_len, 1]
         self.original_inv_freq = self.inv_freq
 
     def _dynamic_frequency_update(self, position_ids, device):
@@ -627,6 +714,7 @@ class GPTNeoXLayer(nn.Module):
         output_attentions: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
+        rope2d_timestep_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ):
         attention_layer_outputs = self.attention(
             self.input_layernorm(hidden_states),
@@ -638,6 +726,7 @@ class GPTNeoXLayer(nn.Module):
             output_attentions=output_attentions,
             cache_position=cache_position,
             position_embeddings=position_embeddings,
+            rope2d_timestep_embeddings=rope2d_timestep_embeddings,
         )
         attn_output = attention_layer_outputs[0]  # output_attn: attn_output, present, (attn_weights)
         attn_output = self.post_attention_dropout(attn_output)
@@ -755,6 +844,8 @@ class GPTNeoXModel(GPTNeoXPreTrainedModel):
         self.layers = nn.ModuleList([GPTNeoXLayer(config, i) for i in range(config.num_hidden_layers)])
         self.final_layer_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.rotary_emb = GPTNeoXRotaryEmbedding(config=config)
+        if config.use_rope_2d:
+            self.rotary_2d_emb = GPTNeoXRotary2DEmbedding(config=config)
 
         self._attn_implementation = config._attn_implementation
 
@@ -790,6 +881,7 @@ class GPTNeoXModel(GPTNeoXPreTrainedModel):
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
         causal_mask: Optional[torch.Tensor] = None,
+        timestep_ids: Optional[torch.LongTensor] = None,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         r"""
         use_cache (`bool`, *optional*):
@@ -858,7 +950,14 @@ class GPTNeoXModel(GPTNeoXPreTrainedModel):
         hidden_states = self.emb_dropout(inputs_embeds)
 
         # create position embeddings to be shared across the decoder layers
-        position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        position_embeddings = self.rotary_emb(hidden_states, position_ids)  # TODO: why?
+        
+        # create timestep embeddings to be shared across the decoder layers
+        if self.config.use_rope_2d:
+            assert timestep_ids is not None, "Timestep IDs are required for 2D RoPE"
+            timestep_embeddings = self.rotary_2d_emb(hidden_states, timestep_ids)
+        else:
+            timestep_embeddings = None
 
         next_decoder_cache = None
         all_attentions = () if output_attentions else None
@@ -893,6 +992,7 @@ class GPTNeoXModel(GPTNeoXPreTrainedModel):
                     output_attentions=output_attentions,
                     cache_position=cache_position,
                     position_embeddings=position_embeddings,
+                    rope2d_timestep_embeddings=timestep_embeddings,
                 )
             hidden_states = outputs[0]
             if use_cache is True:
@@ -1081,6 +1181,7 @@ class GPTNeoXForCausalLM(GPTNeoXPreTrainedModel, GenerationMixin):
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
         causal_mask: Optional[torch.Tensor] = None,
+        timestep_ids: Optional[torch.LongTensor] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         r"""
         labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
@@ -1124,6 +1225,7 @@ class GPTNeoXForCausalLM(GPTNeoXPreTrainedModel, GenerationMixin):
             return_dict=return_dict,
             cache_position=cache_position,
             causal_mask=causal_mask,
+            timestep_ids=timestep_ids,
         )
 
         hidden_states = outputs[0]

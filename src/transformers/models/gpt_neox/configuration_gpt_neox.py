@@ -148,13 +148,17 @@ class GPTNeoXConfig(PretrainedConfig):
         max_position_embeddings=2048,
         initializer_range=0.02,
         layer_norm_eps=1e-5,
-        use_cache=True,
+        use_cache=False,    # TODO
         bos_token_id=0,
         eos_token_id=2,
         tie_word_embeddings=False,
         use_parallel_residual=True,
         rope_scaling=None,
         attention_bias=True,
+        use_rope_2d=False,
+        rope_2d_pct=0.25,
+        rope_2d_max_embedding=64,
+        rope_2d_embed_base=10000,
         **kwargs,
     ):
         super().__init__(bos_token_id=bos_token_id, eos_token_id=eos_token_id, **kwargs)
@@ -179,6 +183,12 @@ class GPTNeoXConfig(PretrainedConfig):
         self.use_parallel_residual = use_parallel_residual
         self.rope_scaling = rope_scaling
         self.attention_bias = attention_bias
+        self.use_rope_2d = use_rope_2d
+        self.rope_2d_pct = rope_2d_pct
+        self.rope_2d_max_embedding = rope_2d_max_embedding
+        self.rope_2d_embed_base = rope_2d_embed_base
+        self.rope_2d_partial_rotary_factor = rope_2d_pct
+        
         # Validate the correctness of rotary position embeddings parameters
         # BC: if there is a 'type' field, move it to 'rope_type'.
         if self.rope_scaling is not None and "type" in self.rope_scaling:
